@@ -8,7 +8,7 @@ where new launch events are ingested, processed, and queried in real time.
 
 ---
 
-## 🧱 Architecture Overview
+## Architecture Overview
 
 The platform consists of **two services** communicating through Kafka
 
