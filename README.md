@@ -10,75 +10,93 @@ where new launch events are ingested, processed, and queried in real time.
 
 ## Architecture Overview
 
-The platform consists of **two services** communicating through Kafka
+
+The platform consists of **four Go services** communicating asynchronously via **Kafka** and persisting state in **Redis**.
 
 ```
 [ HTTP Clients ]
 |
 v
-+––––––––––+           Kafka topic: rocket.events       +------------------+
-|      Gateway       | -------------------------------> |      Tracker     |
-|  :8088 /messages   |                                  |  Kafka consumer  |
-|  :8088 /rockets    | <------------------------------- |  (DLQ optional)  |
-+––––––––––+        (future: compacted snapshots)       +——————+
-|                                                       |
-| REST (read)                                           | apply
-v                                                                  v
-+——————+
-|      Redis       |
-|  rocket states   |
-+——————+
++-----------------+   Kafka topic: rocket.events    +-----------------+
+|   Ingest API    | -----------------------------–> |     Tracker     |
+|  :8088/messages |                                 |  Kafka consumer |
++-----------------+                                 +-----------------+
+|                                                            |
+| (future compacted topic)                                   | apply
+|                                                            v
+|                                                  +----------------+
+|                                                  |     Redis      |
+|                                                  |  rocket states |
+|                                                  +----------------+
+|                                                            ^
+|                                                            |
+|                Kafka topic: rocket.dlq                     |
+|––––––––––––––––––––––––––-----------------------------–––> |
+|                                                            |
++-----------------+                                 +----------------+
+|   DLQ Processor |                                 |   Query API    |
+|  (optional)     |                                 | :8090/rockets  |
++-----------------+                                 +----------------+
 ```
-- **Gateway** — validates incoming HTTP messages and publishes normalized events to Kafka. Also exposes `GET /rockets` that reads current state from Redis.
-- **Tracker** — consumes events from Kafka and atomically applies them to Redis (Lua script), producing an always-up-to-date read model.
-- **Redis** — serves as the real-time state store (fast reads for `GET /rockets`).
-- **(Optional)** DLQ processor, Prometheus, Grafana.
+### 🧩 Component roles
+
+- **Ingest API** — accepts incoming HTTP messages, validates payloads, and publishes normalized events to Kafka.
+- **Tracker** — consumes events from Kafka and atomically applies updates to Redis (via Lua scripts).
+- **Query API** — exposes REST endpoints to read current rocket state directly from Redis.
+- **DLQ Processor** *(optional)* — handles malformed messages from a dead-letter queue.
+- **Redis** — acts as the real-time state store for rocket states.
+- **Kafka (or Redpanda)** — serves as the event bus connecting all components.
 
 ---
 
 ## Project Layout
 ```
-rocket-platform/
-go.mod
-go.sum
-Makefile
-docker-compose.yml              # redpanda (Kafka), redis, prometheus, grafana
-README.md
+rocket-platform/                      # Go mono-repo (Go 1.22+)
 
-/cmd
-/gateway                        # HTTP :8088 -> /messages + /rockets
-    main.go
-/tracker                        # Kafka consumer -> Redis apply
-    main.go
+  go.mod
+  go.sum
+  Makefile                            # build / lint / test commands
+  docker-compose.yml                  # redpanda (Kafka), redis, prometheus, grafana
+  README.md
 
-/internal
-/config                         # env + defaults
-    config.go
-/log                            # zap logger
-    logger.go
-/telemetry                      # (optional) OTel + Prometheus
-    telemetry.go
-/kafka                          # producer/consumer helpers
-    producer.go
-    consumer.go
-/redis                          # redis client + Lua scripts
-    client.go
-    scripts.go
-scripts/
-    apply_and_drain.lua
-/contracts                      # request/events schemas + validation
-    message.go
-    event.go
-    validate.go
-/model                          # domain models (rocket state, snapshot)
-    rocket.go
-/query                          # read models from Redis (for /rockets)
-    repo.go
-/apply                          # apply events -> Redis (used by tracker)
-    apply.go
-/httpmw                         # chi middlewares (request-id, recover, logging)
-    requestid.go
-    recover.go
+  cmd/                                # 4 independent binaries (services)
+    ingest-api/                       # HTTP -> Kafka (write path)
+      main.go
+    tracker/                          # Kafka -> Redis (apply state, Lua)
+      main.go
+    query-api/                        # HTTP -> Redis (read path)
+      main.go
+    dlq-processor/                    # Kafka DLQ handler (optional)
+      main.go
+
+  internal/                           # shared logic and libraries
+    config/                           # env vars, defaults
+      config.go
+    log/                              # zap logger setup
+      logger.go
+    telemetry/                        # (optional) OpenTelemetry + Prometheus
+      telemetry.go
+    kafka/                            # producer / consumer helpers
+      producer.go
+      consumer.go
+    redis/                            # redis client + atomic Lua scripts
+      client.go
+      scripts.go
+      scripts/
+        apply_and_drain.lua           # apply event + drain per channel
+    contracts/                        # schemas + validation
+      message.go                      # legacy {metadata, message}
+      event.go                        # normalized Kafka event
+      validate.go
+    model/                            # domain models (rocket state, snapshot)
+      rocket.go
+    apply/                            # apply events -> Redis (used by tracker)
+      apply.go
+    query/                            # read models from Redis (for /rockets)
+      repo.go
+    httpmw/                           # middlewares (request-id, recover, logging)
+      requestid.go
+      recover.go
 ```
 
 ## Endpoints
